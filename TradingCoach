@@ -1,0 +1,1035 @@
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import {
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+  Area,
+  AreaChart,
+} from 'recharts';
+import {
+  TrendingUp,
+  TrendingDown,
+  AlertCircle,
+  CheckCircle,
+  Clock,
+  Target,
+  Shield,
+  Brain,
+  FileText,
+  Download,
+  Upload,
+  ChevronRight,
+  Award,
+  AlertTriangle,
+  Activity,
+  Settings,
+  Plus,
+  X,
+  Edit2,
+  Save,
+  BookOpen,
+  ChevronsUpDown,
+} from 'lucide-react';
+import { createRoot } from 'react-dom/client';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  signInAnonymously,
+  signInWithCustomToken,
+  onAuthStateChanged,
+} from 'firebase/auth';
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  addDoc,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+  collection,
+  query,
+  where,
+  addDoc,
+  getDocs,
+} from 'firebase/firestore';
+
+// --- UTILITIES ---
+function classNames(...args) {
+  return args.filter(Boolean).join(' ');
+}
+
+function todayKey() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+function saveLocal(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    console.error('Failed to save to localStorage:', e);
+  }
+}
+
+function loadLocal(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/);
+  if (lines.length === 0) return [];
+
+  const firstLine = lines[0] || '';
+  const delimiter = firstLine.includes('\t')
+    ? '\t'
+    : firstLine.includes(';')
+    ? ';'
+    : ',';
+
+  const headers = firstLine
+    .split(delimiter)
+    .map((h) => h.trim().replace(/^["']|["']$/g, ''));
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const values = lines[i]
+      .split(delimiter)
+      .map((v) => v.trim().replace(/^["']|["']$/g, ''));
+    const row = {};
+    headers.forEach((h, idx) => {
+      row[h] = values[idx] || '';
+    });
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function parseNumber(x) {
+  if (x == null) return 0;
+  const cleaned = String(x)
+    .replace(/[£$€,]/g, '')
+    .trim();
+  const n = parseFloat(cleaned);
+  return isNaN(n) ? 0 : n;
+}
+
+function parseDateGuess(s) {
+  if (!s) return null;
+  let str = String(s).trim();
+
+  let d = new Date(str);
+  if (!isNaN(d.getTime())) return d;
+
+  const match = str.match(
+    /(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?/
+  );
+  if (match) {
+    const dd = parseInt(match[1], 10);
+    const mm = parseInt(match[2], 10) - 1;
+    const yyyy = parseInt(
+      match[3].length === 2 ? '20' + match[3] : match[3],
+      10
+    );
+    const HH = match[4] ? parseInt(match[4], 10) : 0;
+    const MM = match[5] ? parseInt(match[5], 10) : 0;
+    d = new Date(yyyy, mm, dd, HH, MM);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
+function timeToMinutes(t) {
+  if (!t) return 0;
+  const parts = t.split(':');
+  return parseInt(parts[0], 10) * 60 + parseInt(parts[1] || 0, 10);
+}
+
+function minutesOfDay(d) {
+  if (!d) return 0;
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function withinAnyWindow(date, windows) {
+  if (!date) return false;
+  const m = minutesOfDay(date);
+  return windows.some(
+    (w) => m >= timeToMinutes(w.start) && m <= timeToMinutes(w.end)
+  );
+}
+
+function fmt(n, currency = '£') {
+  const sign = n < 0 ? '-' : '';
+  const v = Math.abs(n).toFixed(2);
+  return `${sign}${currency}${v}`;
+}
+
+// --- PRESETS & DEFAULTS ---
+
+const MARKET_PRESETS = {
+  'DAX 40': {
+    name: 'DAX 40 (Germany)',
+    tradingHours: [
+      {
+        label: 'Morning Session',
+        start: '09:00',
+        end: '11:00',
+        color: '#3b82f6',
+      },
+      { label: 'US Overlap', start: '13:30', end: '15:30', color: '#10b981' },
+    ],
+  },
+  'NASDAQ 100': {
+    name: 'NASDAQ 100 (US Tech)',
+    tradingHours: [
+      { label: 'Opening Hour', start: '14:30', end: '15:30', color: '#ef4444' },
+      { label: 'Power Hour', start: '19:00', end: '21:00', color: '#f59e0b' },
+    ],
+  },
+  'FTSE 100': {
+    name: 'FTSE 100 (UK)',
+    tradingHours: [
+      { label: 'Morning', start: '08:00', end: '10:00', color: '#3b82f6' },
+      { label: 'US Open', start: '14:30', end: '16:30', color: '#f59e0b' },
+    ],
+  },
+};
+
+const DEFAULT_CONFIG = {
+  selectedMarkets: ['FTSE 100'],
+  reportingCurrency: '£',
+  affirmations: [
+    'I am a disciplined trader. I trade only my plan.',
+    'I protect my capital first; profits follow.',
+    'I execute without emotion and review with clarity.',
+  ],
+  dailyLimits: {
+    maxLoss: 500,
+    profitTarget: 1000,
+  },
+};
+
+const DEFAULT_CHECKLIST = {
+  pre: [
+    { id: 'plan', text: 'Trading plan reviewed', done: false, critical: true },
+    {
+      id: 'limits',
+      text: 'Daily limits confirmed',
+      done: false,
+      critical: true,
+    },
+  ],
+  during: [
+    {
+      id: 'sizing',
+      text: 'Position sizing is correct',
+      done: false,
+      critical: true,
+    },
+    {
+      id: 'setup',
+      text: 'Only trading A+ setups',
+      done: false,
+      critical: true,
+    },
+  ],
+  post: [
+    {
+      id: 'close',
+      text: 'Platform closed on time',
+      done: false,
+      critical: true,
+    },
+    {
+      id: 'journal',
+      text: 'Key lessons journaled',
+      done: false,
+      critical: false,
+    },
+  ],
+};
+
+const JOURNAL_PROMPT_TEMPLATE = `### Trade Debrief
+
+- **Thesis & Rationale:** What was my primary reason for entering this trade? Did it align with my trading plan?
+
+- **Execution:** Was my entry at a good price? Did I respect my stop-loss?
+
+- **Emotional State:** What was my mindset going into the trade? Did my emotions change during the trade?
+
+- **Lesson Learned:** What is the single most important takeaway from this trade?
+`;
+
+// --- SUB-COMPONENTS ---
+
+// NEW: Settings Modal Component
+function SettingsModal({ config, setConfig, onClose }) {
+  const [localConfig, setLocalConfig] = useState(config);
+
+  const handleSave = () => {
+    setConfig(localConfig);
+    onClose();
+  };
+
+  const handleAffirmationsChange = (e) => {
+    setLocalConfig((prev) => ({
+      ...prev,
+      affirmations: e.target.value.split('\n'),
+    }));
+  };
+
+  return (
+    <div className="fixed inset-0 z-30 bg-black bg-opacity-50 flex justify-center items-center">
+      <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-md">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-xl font-bold">Settings</h2>
+          <button
+            onClick={onClose}
+            className="p-1 rounded-full hover:bg-gray-200"
+          >
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Reporting Currency
+            </label>
+            <select
+              value={localConfig.reportingCurrency}
+              onChange={(e) =>
+                setLocalConfig((prev) => ({
+                  ...prev,
+                  reportingCurrency: e.target.value,
+                }))
+              }
+              className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md"
+            >
+              <option value="£">Pound (£)</option>
+              <option value="€">Euro (€)</option>
+              <option value="$">Dollar ($)</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Daily Max Loss ({localConfig.reportingCurrency})
+            </label>
+            <input
+              type="number"
+              value={localConfig.dailyLimits.maxLoss}
+              onChange={(e) =>
+                setLocalConfig((prev) => ({
+                  ...prev,
+                  dailyLimits: {
+                    ...prev.dailyLimits,
+                    maxLoss: Number(e.target.value),
+                  },
+                }))
+              }
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Daily Profit Target ({localConfig.reportingCurrency})
+            </label>
+            <input
+              type="number"
+              value={localConfig.dailyLimits.profitTarget}
+              onChange={(e) =>
+                setLocalConfig((prev) => ({
+                  ...prev,
+                  dailyLimits: {
+                    ...prev.dailyLimits,
+                    profitTarget: Number(e.target.value),
+                  },
+                }))
+              }
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Affirmations (one per line)
+            </label>
+            <textarea
+              value={localConfig.affirmations.join('\n')}
+              onChange={handleAffirmationsChange}
+              rows={4}
+              className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+        </div>
+
+        <div className="mt-6 flex justify-end">
+          <button
+            onClick={handleSave}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+          >
+            <Save size={16} /> Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MarketSelector({ selectedMarkets, onToggle }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const selectedNames =
+    selectedMarkets.length > 0 ? selectedMarkets.join(', ') : 'Select Markets';
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full sm:w-48 flex items-center justify-between rounded-md border border-gray-300 bg-white px-3 py-2 text-left shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+      >
+        <span className="truncate">{selectedNames}</span>
+        <ChevronsUpDown className="h-5 w-5 text-gray-400" />
+      </button>
+      {isOpen && (
+        <div className="absolute z-10 mt-1 w-full rounded-md bg-white shadow-lg border">
+          <ul className="max-h-60 overflow-auto py-1">
+            {Object.keys(MARKET_PRESETS).map((key) => (
+              <li
+                key={key}
+                className="flex cursor-pointer items-center p-2 text-gray-900 hover:bg-gray-100"
+                onClick={() => onToggle(key)}
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedMarkets.includes(key)}
+                  readOnly
+                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="ml-3 block truncate">
+                  {MARKET_PRESETS[key].name}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function JournalInput({ onAdd }) {
+  const [value, setValue] = useState('');
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (value.trim()) {
+      onAdd(value);
+      setValue('');
+    }
+  };
+  return (
+    <form onSubmit={handleSubmit} className="space-y-2">
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="Log your thoughts on a trade or your overall session..."
+        className="w-full h-32 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+      />
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={() => setValue(JOURNAL_PROMPT_TEMPLATE)}
+          className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors flex items-center gap-2"
+        >
+          <BookOpen size={16} /> Use Template
+        </button>
+        <button
+          type="submit"
+          className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+        >
+          <Plus size={16} /> Add Entry
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function ChecklistSection({ title, icon: Icon, items, onToggle, color }) {
+  const completed = items.filter((i) => i.done).length;
+  const progress = (completed / items.length) * 100;
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center space-x-2">
+          <Icon
+            className={classNames(
+              'w-5 h-5',
+              color === 'amber'
+                ? 'text-amber-600'
+                : color === 'green'
+                ? 'text-green-600'
+                : 'text-blue-600'
+            )}
+          />{' '}
+          <h3 className="font-semibold">{title}</h3>
+        </div>
+        <span className="text-sm text-gray-500">
+          {completed}/{items.length}
+        </span>
+      </div>
+      <div className="w-full bg-gray-200 rounded-full h-2 mb-4">
+        <div
+          className={classNames(
+            'h-2 rounded-full transition-all duration-300',
+            color === 'amber'
+              ? 'bg-amber-600'
+              : color === 'green'
+              ? 'bg-green-600'
+              : 'bg-blue-600'
+          )}
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <div className="space-y-2">
+        {items.map((item) => (
+          <label
+            key={item.id}
+            className="flex items-start cursor-pointer group"
+          >
+            <input
+              type="checkbox"
+              checked={item.done}
+              onChange={() => onToggle(item.id)}
+              className="mt-1 mr-3 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+            />
+            <div className="flex-1">
+              <span
+                className={classNames(
+                  'text-sm',
+                  item.done ? 'text-gray-500 line-through' : 'text-gray-700'
+                )}
+              >
+                {item.text}
+              </span>{' '}
+              {item.critical && (
+                <span className="ml-2 text-xs text-red-600 font-medium">
+                  CRITICAL
+                </span>
+              )}
+            </div>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const StatCard = ({ icon: Icon, title, value, color, currency, unit }) => (
+  <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+    <div className="flex items-center justify-between">
+      <h3 className="text-gray-500 font-medium">{title}</h3>
+      <Icon className={`w-6 h-6 ${color}`} />
+    </div>
+    <p className="text-3xl font-bold mt-2">
+      {currency && value != null
+        ? fmt(value, currency).replace(/^[+\-]/, '')
+        : `${value}${unit || ''}`}
+    </p>
+  </div>
+);
+
+// --- MAIN APP COMPONENT ---
+function TradingCoachDashboard() {
+  const [config, setConfig] = useState(() =>
+    loadLocal('tc_config', DEFAULT_CONFIG)
+  );
+  const [dateKey, setDateKey] = useState(() =>
+    loadLocal('tc_dateKey', todayKey())
+  );
+  const [notes, setNotes] = useState(() =>
+    loadLocal(`tc_notes_${dateKey}`, [])
+  );
+  const [checklist, setChecklist] = useState(() =>
+    loadLocal(`tc_checklist_${dateKey}`, DEFAULT_CHECKLIST)
+  );
+  const [trades, setTrades] = useState(() =>
+    loadLocal(`tc_trades_${dateKey}`, [])
+  );
+  const [motivationIdx, setMotivationIdx] = useState(0);
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [showSettings, setShowSettings] = useState(false);
+  const [showInsights, setShowInsights] = useState(false);
+  const [loadingInsights, setLoadingInsights] = useState(false);
+  const [insightsContent, setInsightsContent] = useState('');
+
+  const combinedTradingWindows = useMemo(() => {
+    const windows = config.selectedMarkets.flatMap((marketKey) => {
+      const preset = MARKET_PRESETS[marketKey];
+      if (!preset) return [];
+      return preset.tradingHours.map((h) => ({ ...h, market: marketKey }));
+    });
+    return windows.sort(
+      (a, b) => timeToMinutes(a.start) - timeToMinutes(b.start)
+    );
+  }, [config.selectedMarkets]);
+
+  // Firebase state
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // Initialize Firebase and set up auth listener
+  useEffect(() => {
+    try {
+      const firebaseConfig = JSON.parse(
+        typeof __firebase_config !== 'undefined'
+          ? __firebase_config
+          : '{}'
+      );
+      if (Object.keys(firebaseConfig).length > 0) {
+        const app = initializeApp(firebaseConfig);
+        const firestoreDb = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+        setDb(firestoreDb);
+        setAuth(firebaseAuth);
+
+        const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+          if (user) {
+            setUserId(user.uid);
+          } else {
+            const anonymousUser = await signInAnonymously(firebaseAuth);
+            setUserId(anonymousUser.user.uid);
+          }
+          setIsAuthReady(true);
+        });
+
+        if (typeof __initial_auth_token !== 'undefined') {
+          signInWithCustomToken(firebaseAuth, __initial_auth_token);
+        }
+
+        return () => unsubscribe();
+      } else {
+        setIsAuthReady(true); // Treat as ready if Firebase isn't configured
+      }
+    } catch (e) {
+      console.error('Failed to initialize Firebase:', e);
+      setIsAuthReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isAuthReady) {
+      saveLocal('tc_config', config);
+    }
+  }, [config, isAuthReady]);
+  useEffect(() => {
+    if (isAuthReady) {
+      saveLocal(`tc_notes_${dateKey}`, notes);
+    }
+  }, [notes, dateKey, isAuthReady]);
+  useEffect(() => {
+    if (isAuthReady) {
+      saveLocal(`tc_checklist_${dateKey}`, checklist);
+    }
+  }, [checklist, dateKey, isAuthReady]);
+  useEffect(() => {
+      if (isAuthReady) {
+          saveLocal(`tc_trades_${dateKey}`, trades);
+      }
+  }, [trades, dateKey, isAuthReady]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setMotivationIdx((i) => (i + 1) % config.affirmations.length);
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [config.affirmations.length]);
+
+  useEffect(() => {
+    setNotes(loadLocal(`tc_notes_${dateKey}`, []));
+    setChecklist(loadLocal(`tc_checklist_${dateKey}`, DEFAULT_CHECKLIST));
+    setTrades(loadLocal(`tc_trades_${dateKey}`, []));
+  }, [dateKey]);
+
+  const totalPnL = useMemo(
+    () => trades.reduce((sum, t) => sum + (t.pnl || 0), 0),
+    [trades]
+  );
+  const winRate = useMemo(() => {
+    if (!trades.length) return 0;
+    const wins = trades.filter((t) => t.pnl > 0).length;
+    return (wins / trades.length) * 100;
+  }, [trades]);
+
+  const handleMarketToggle = useCallback((marketKey) => {
+    setConfig((prev) => {
+      const newSelected = prev.selectedMarkets.includes(marketKey)
+        ? prev.selectedMarkets.filter((m) => m !== marketKey)
+        : [...prev.selectedMarkets, marketKey];
+      return { ...prev, selectedMarkets: newSelected };
+    });
+  }, []);
+
+  const toggleChecklist = useCallback((section, id) => {
+    setChecklist((prev) => ({
+      ...prev,
+      [section]: prev[section].map((item) =>
+        item.id === id ? { ...item, done: !item.done } : item
+      ),
+    }));
+  }, []);
+
+  const addNote = useCallback((text) => {
+    if (!text?.trim()) return;
+    setNotes((prev) => [
+      {
+        id: Date.now(),
+        text: text.trim(),
+        timestamp: new Date().toISOString(),
+      },
+      ...prev,
+    ]);
+  }, []);
+
+  const onFileUpload = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = String(reader.result || '');
+        const rows = parseCSV(text);
+        const mappedTrades = rows
+          .map((row) => {
+            const dateStr = row['Date'] || row['Time'] || row['Open Period'];
+            const date = parseDateGuess(dateStr);
+            let pnl = 0;
+            const pnlFields = ['P/L', 'P&L', 'Profit', 'PnL', 'Result'];
+            for (const field of pnlFields) {
+              if (row[field]) {
+                pnl = parseNumber(row[field]);
+                break;
+              }
+            }
+            return { date, pnl };
+          })
+          .filter((t) => t.date && !isNaN(t.pnl));
+        setTrades(mappedTrades);
+        setActiveTab('dashboard');
+      } catch (error) {
+        alert('Error parsing CSV file.');
+      }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  // Gemini API function to analyze journal entries
+  const analyzeJournal = useCallback(async () => {
+    if (notes.length === 0) {
+      setInsightsContent('No journal entries to analyze. Please add some first.');
+      setShowInsights(true);
+      return;
+    }
+
+    setLoadingInsights(true);
+    setInsightsContent('');
+    setShowInsights(true);
+
+    const journalText = notes.map(n => n.text).join('\n---\n');
+    const prompt = `Analyze the following trading journal entries to provide concise and actionable insights.
+    Identify recurring emotional states, key lessons, and any patterns (positive or negative) in the trader's behavior.
+    The response should be a few paragraphs, easy to read, and offer a clear summary. Do not include any extra conversation.
+    
+    Journal entries:
+    ${journalText}`;
+
+    const payload = {
+      contents: [{
+        parts: [{
+          text: prompt
+        }]
+      }]
+    };
+    
+    const apiKey = ""; // Canvas environment provides this
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+    let retries = 0;
+    const maxRetries = 5;
+
+    while (retries < maxRetries) {
+      try {
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          throw new Error(`API error: ${response.status} ${response.statusText}`);
+        }
+
+        const result = await response.json();
+        const content = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (content) {
+          setInsightsContent(content);
+          setLoadingInsights(false);
+          return;
+        } else {
+          throw new Error('No content received from API.');
+        }
+
+      } catch (error) {
+        console.error('API call failed, retrying...', error);
+        retries++;
+        await new Promise(res => setTimeout(res, Math.pow(2, retries) * 1000));
+      }
+    }
+    setInsightsContent('Failed to generate insights. Please try again later.');
+    setLoadingInsights(false);
+  }, [notes]);
+
+  const tabs = [
+    { id: 'dashboard', label: 'Dashboard', icon: Shield },
+    { id: 'journal', label: 'Journal', icon: FileText },
+  ];
+
+  return (
+    <>
+      {showSettings && (
+        <SettingsModal
+          config={config}
+          setConfig={setConfig}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+      {showInsights && (
+        <div className="fixed inset-0 z-30 bg-black bg-opacity-50 flex justify-center items-center">
+          <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-md">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold">Journal Insights</h2>
+              <button
+                onClick={() => setShowInsights(false)}
+                className="p-1 rounded-full hover:bg-gray-200"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            {loadingInsights ? (
+              <div className="text-center py-8">
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-500 border-t-transparent mx-auto"></div>
+                <p className="mt-4 text-gray-600">Generating insights...</p>
+              </div>
+            ) : (
+              <div className="prose prose-sm max-w-none">
+                <p>{insightsContent}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="min-h-screen bg-gray-50 text-gray-800">
+        <header className="bg-white/80 backdrop-blur-lg sticky top-0 z-20 border-b border-gray-200">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex flex-wrap justify-between items-center gap-4">
+            <div className="flex items-center gap-4">
+              <Activity className="h-8 w-8 text-blue-600" />{' '}
+              <h1 className="text-2xl font-bold text-gray-900">
+                Trading Coach
+              </h1>
+            </div>
+            <div className="flex items-center gap-2 sm:gap-4">
+              <MarketSelector
+                selectedMarkets={config.selectedMarkets}
+                onToggle={handleMarketToggle}
+              />
+              <input
+                type="date"
+                value={dateKey}
+                onChange={(e) => setDateKey(e.target.value)}
+                className="rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+              />
+              <button
+                onClick={() => setShowSettings(true)}
+                className="p-2 rounded-full hover:bg-gray-200"
+              >
+                <Settings className="w-6 h-6 text-gray-600" />
+              </button>
+            </div>
+          </div>
+          <div className="border-t border-gray-200">
+            <nav className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 -mb-px flex space-x-8">
+              {tabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={classNames(
+                    'flex items-center gap-2 whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm',
+                    activeTab === tab.id
+                      ? 'border-blue-500 text-blue-600'
+                      : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                  )}
+                >
+                  <tab.icon size={16} /> {tab.label}
+                </button>
+              ))}
+            </nav>
+          </div>
+        </header>
+
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+          {activeTab === 'dashboard' && (
+            <div className="space-y-8">
+              <div className="bg-blue-600 text-white p-4 rounded-lg text-center shadow-lg">
+                <p className="font-medium">
+                  "{config.affirmations[motivationIdx]}"
+                </p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <StatCard
+                  icon={TrendingUp}
+                  title="Today's P&L"
+                  value={totalPnL}
+                  currency={config.reportingCurrency}
+                  color="text-green-500"
+                />
+                <StatCard
+                  icon={CheckCircle}
+                  title="Win Rate"
+                  value={winRate}
+                  unit="%"
+                  color="text-blue-500"
+                />
+                <StatCard
+                  icon={Activity}
+                  title="Trades"
+                  value={trades.length}
+                  color="text-indigo-500"
+                />
+              </div>
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <h3 className="font-semibold mb-4">Market Hours</h3>
+                <div className="space-y-2">
+                  {combinedTradingWindows.map((w, i) => (
+                    <div key={i} className="flex items-center text-sm">
+                      <span className="font-mono text-gray-600">
+                        {w.start} - {w.end}
+                      </span>
+                      <div
+                        className="h-2 w-2 rounded-full mx-2"
+                        style={{ backgroundColor: w.color }}
+                      ></div>
+                      <span className="text-gray-800">{w.label}</span>
+                      <span className="text-xs text-gray-500 ml-2 px-2 py-0.5 bg-gray-100 rounded-full">
+                        {w.market}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <ChecklistSection
+                  title="Pre-Trade"
+                  icon={Shield}
+                  items={checklist.pre}
+                  onToggle={(id) => toggleChecklist('pre', id)}
+                  color="blue"
+                />
+                <ChecklistSection
+                  title="In-Trade"
+                  icon={Target}
+                  items={checklist.during}
+                  onToggle={(id) => toggleChecklist('during', id)}
+                  color="amber"
+                />
+                <ChecklistSection
+                  title="Post-Trade"
+                  icon={Award}
+                  items={checklist.post}
+                  onToggle={(id) => toggleChecklist('post', id)}
+                  color="green"
+                />
+              </div>
+              <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <h3 className="font-semibold mb-4">Import Trades</h3>
+                <label className="cursor-pointer px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2 max-w-xs">
+                  <Upload size={16} /> Upload Trades (CSV)
+                  <input
+                    type="file"
+                    accept=".csv, .txt"
+                    onChange={onFileUpload}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'journal' && (
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 space-y-6">
+              <div className="flex justify-between items-center">
+                <h2 className="text-2xl font-bold">Daily Journal</h2>
+                <button
+                  onClick={analyzeJournal}
+                  className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors flex items-center gap-2"
+                >
+                  <Brain size={16} /> Get Insights
+                </button>
+              </div>
+              <JournalInput onAdd={addNote} />
+              <div className="space-y-4">
+                {notes.map((note) => (
+                  <div
+                    key={note.id}
+                    className="bg-gray-50 p-4 rounded-lg prose prose-sm max-w-none"
+                  >
+                    <p className="text-xs text-gray-500 mt-1">
+                      {new Date(note.timestamp).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </p>
+                    <div
+                      dangerouslySetInnerHTML={{
+                        __html: note.text.replace(/\n/g, '<br />'),
+                      }}
+                    />
+                  </div>
+                ))}
+                {notes.length === 0 && (
+                  <p className="text-gray-500 text-center py-4">
+                    No journal entries for today.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    </>
+  );
+}
+
+// --- FINAL RENDER CALL ---
+export default TradingCoachDashboard;
